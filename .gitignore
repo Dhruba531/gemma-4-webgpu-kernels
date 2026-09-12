@@ -1,0 +1,9 @@
+node_modules/
+*.log
+.DS_Store
+rust/target/
+rust/models/
+models/
+.claude/
+# copies of the original HF Space + checkpoint metadata; kept local only
+reference/

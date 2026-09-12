@@ -1,0 +1,15 @@
+{
+  "name": "gemma-4-webgpu-kernels",
+  "version": "1.0.0",
+  "description": "Gemma-4 E2B running in the browser on WebGPU, every kernel hand-written from scratch.",
+  "type": "module",
+  "scripts": {
+    "serve": "node serve.mjs 8080",
+    "test": "node test/model.test.mjs && node test/tokenizer.test.mjs && node test/weights.test.mjs && node test/hub.test.mjs && node test/stream.test.mjs && node test/gpu.test.mjs && node test/quant.test.mjs",
+    "test:gpu-integration": "node test/realfmt.test.mjs && node test/stream-gpu.test.mjs",
+    "bench": "node test/bench.mjs"
+  },
+  "devDependencies": {
+    "webgpu": "^0.4.0"
+  }
+}

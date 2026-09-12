@@ -1,0 +1,40 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>Gemma-4 WebGPU bench</title>
+<style>
+  body { font: 14px/1.5 ui-monospace, monospace; background: #111; color: #ddd; margin: 2rem; }
+  #log { white-space: pre-wrap; }
+</style>
+<h1>Gemma-4 WebGPU bench (synthetic weights, real shapes)</h1>
+<p>Query params: <code>?prefill=64&amp;decode=24&amp;vdiv=1</code></p>
+<div id="log"></div>
+<script type="module">
+  const el = document.getElementById("log");
+  const log = (s) => { el.textContent += s + "\n"; console.log(s); };
+  const qs = new URLSearchParams(location.search);
+  try {
+    const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
+    const wantBytes = Math.min(adapter.limits.maxStorageBufferBindingSize, adapter.limits.maxBufferSize);
+    const device = await adapter.requestDevice({
+      requiredLimits: { maxStorageBufferBindingSize: wantBytes, maxBufferSize: wantBytes },
+    });
+    device.lost.then((info) => log(`DEVICE LOST: ${info.reason} ${info.message}`));
+    log(`device: maxBuffer ${(wantBytes / 2 ** 30).toFixed(1)} GiB`);
+    const configRaw = await (await fetch("../reference/config.json")).json();
+    const { runBench, runKernelBench } = await import("./bench-core.mjs");
+    if (qs.get("mode") === "kernels") {
+      await runKernelBench({ device, log });
+      log("DONE kernels");
+    } else {
+      const res = await runBench({
+        device, configRaw, log,
+        prefill: Number(qs.get("prefill") ?? 64),
+        decode: Number(qs.get("decode") ?? 24),
+        vdiv: Number(qs.get("vdiv") ?? 1),
+      });
+      log("DONE " + JSON.stringify({ prefillPerTok: +res.prefillPerTok.toFixed(2), decodeMedian: +res.decodeMedian.toFixed(2) }));
+    }
+  } catch (e) {
+    log("ERROR: " + (e.stack ?? e.message ?? e));
+  }
+</script>

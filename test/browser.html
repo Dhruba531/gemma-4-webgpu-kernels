@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Engine self-test (browser WebGPU)</title>
+<style>
+  body { background:#0a0a0c; color:#ddd; font:14px ui-monospace,Menlo,monospace; padding:24px; }
+  .ok { color:#64ffa0; } .err { color:#ff7a6b; } h1 { font-size:16px; }
+</style>
+</head>
+<body>
+<h1>Gemma-4 WebGPU engine — in-browser self-test</h1>
+<div id="out"></div>
+<script type="module">
+import { CpuBackend } from "../src/engine/backend-cpu.js";
+import { WebGpuBackend } from "../src/engine/backend-webgpu.js";
+import { requestDevice } from "../src/engine/device.js";
+import { Gemma4Config } from "../src/model/config.js";
+import { Gemma4Model } from "../src/model/gemma4.js";
+
+const out = document.getElementById("out");
+const log = (m, cls = "") => { const d = document.createElement("div"); d.className = cls; d.textContent = m; out.appendChild(d); console.log(m); };
+let fails = 0;
+const rng = (() => { let a = 7; return () => ((a = (a * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff); })();
+const rand = (n, s = 1) => Float32Array.from({ length: n }, () => (rng() * 2 - 1) * s);
+
+async function close(label, G, gt, ct, tol = 3e-3) {
+  const g = await G.readback(gt); const c = ct.data ?? ct;
+  let max = 0; for (let i = 0; i < c.length; i++) max = Math.max(max, Math.abs(g[i] - c[i]));
+  const pass = max < tol;
+  if (!pass) fails++;
+  log(`${pass ? "✓" : "✗"} ${label} (max diff ${max.toExponential(2)})`, pass ? "ok" : "err");
+}
+
+try {
+  const { device, info } = await requestDevice();
+  log(`device: ${info.vendor} ${info.architecture}`, "ok");
+  const G = new WebGpuBackend(device); const C = new CpuBackend();
+
+  { const M=17,K=40,N=23,x=rand(M*K),w=rand(N*K);
+    await close("linear", G, G.linear(G.tensor(x,[M,K]),G.tensor(w,[N,K])), C.linear(C.tensor(x,[M,K]),C.tensor(w,[N,K]))); }
+  { const T=5,D=48,x=rand(T*D),w=rand(D,.1);
+    await close("rmsNorm", G, G.rmsNorm(G.tensor(x,[T,D]),G.tensor(w,[D]),1e-6), C.rmsNorm(C.tensor(x,[T,D]),C.tensor(w,[D]),1e-6)); }
+  { const T=4,h=2,Dh=16,rot=8,pos=[0,1,5,9],x=rand(T*h*Dh);
+    await close("rope", G, G.rope(G.tensor(x,[T,h,Dh]),pos,1e4,Dh,h,rot), C.rope(C.tensor(x,[T,h,Dh]),pos,1e4,Dh,h,rot)); }
+  { const T=6,S=6,Hq=4,Hkv=1,Dh=16,q=rand(T*Hq*Dh),k=rand(S*Hkv*Dh),v=rand(S*Hkv*Dh);
+    const o={qPos:[0,1,2,3,4,5],kPos:[0,1,2,3,4,5],scale:1/Math.sqrt(Dh),slidingWindow:3,attnSoftcap:0};
+    await close("attention", G, G.attention(G.tensor(q,[T,Hq,Dh]),G.tensor(k,[S,Hkv,Dh]),G.tensor(v,[S,Hkv,Dh]),o),
+                                C.attention(C.tensor(q,[T,Hq,Dh]),C.tensor(k,[S,Hkv,Dh]),C.tensor(v,[S,Hkv,Dh]),o)); }
+
+  // full tiny model parity
+  const cfg = new Gemma4Config({ text_config: {
+    vocab_size:48, hidden_size:32, intermediate_size:64, num_hidden_layers:6,
+    num_attention_heads:4, num_key_value_heads:1, head_dim:8, global_head_dim:16,
+    hidden_size_per_layer_input:12, vocab_size_per_layer_input:48, num_kv_shared_layers:2,
+    sliding_window:3, rms_norm_eps:1e-6, final_logit_softcapping:30,
+    rope_parameters:{ full_attention:{rope_theta:1e6,partial_rotary_factor:0.25}, sliding_attention:{rope_theta:1e4} },
+    layer_types:["sliding_attention","full_attention","sliding_attention","sliding_attention","sliding_attention","sliding_attention"],
+  }});
+  const wstore = new Map();
+  const mkW = (B) => ({ get(n){ const key=B.name+n; if(wstore.has(key)) return wstore.get(key);
+    // shape inference identical to test/util
+    const H=cfg.hidden_size,I=cfg.intermediate_size,V=cfg.vocab_size,P=cfg.hidden_size_per_layer_input,L=cfg.num_hidden_layers,Hq=cfg.num_attention_heads,Hkv=cfg.num_key_value_heads;
+    let shape; const m=/^language_model\.layers\.(\d+)\.(.+)$/.exec(n);
+    if(n==="language_model.embed_tokens.weight")shape=[V,H];
+    else if(n==="language_model.embed_tokens_per_layer.weight")shape=[V,L*P];
+    else if(n==="language_model.norm.weight")shape=[H];
+    else if(n==="lm_head.weight")shape=[V,H];
+    else if(m){const i=+m[1],Dh=cfg.headDim(i),s=m[2];const tbl={
+      "input_layernorm.weight":[H],"post_attention_layernorm.weight":[H],"pre_feedforward_layernorm.weight":[H],
+      "post_feedforward_layernorm.weight":[H],"post_per_layer_input_norm.weight":[H],
+      "self_attn.q_proj.weight":[Hq*Dh,H],"self_attn.k_proj.weight":[Hkv*Dh,H],"self_attn.v_proj.weight":[Hkv*Dh,H],
+      "self_attn.o_proj.weight":[H,Hq*Dh],"self_attn.q_norm.weight":[Dh],"self_attn.k_norm.weight":[Dh],
+      "mlp.gate_proj.weight":[I,H],"mlp.up_proj.weight":[I,H],"mlp.down_proj.weight":[H,I],
+      "per_layer_input_gate.weight":[P,H],"per_layer_projection.weight":[H,P]}; shape=tbl[s]; }
+    const numel=shape.reduce((a,b)=>a*b,1); const isNorm=n.endsWith("norm.weight");
+    const data=new Float32Array(numel); for(let i=0;i<numel;i++)data[i]=(rng()*2-1)*(isNorm?0.02:0.04);
+    const t=B.tensor(data,shape); wstore.set(key,t); return t; } });
+
+  // share identical raw data between backends by drawing CPU first then GPU from same rng seed:
+  // simplest: build CPU weights, then build GPU weights from CPU arrays.
+  const wc = mkW(C);
+  const ids=[2,5,11,19,30], pos=ids.map((_,i)=>i);
+  const cl = await new Gemma4Model(cfg, C, wc).forward(ids,pos);
+  const wg = { get(n){ const t=wc.get(n); return G.tensor(t.data, t.shape); } };
+  const gl = await new Gemma4Model(cfg, G, wg).forward(ids,pos);
+  let max=0; for(let i=0;i<cl.length;i++)max=Math.max(max,Math.abs(cl[i]-gl[i]));
+  const pass=max<5e-3; if(!pass)fails++;
+  log(`${pass?"✓":"✗"} full Gemma-4 forward parity (max diff ${max.toExponential(2)})`, pass?"ok":"err");
+
+  log(fails===0 ? "\nALL BROWSER CHECKS PASSED" : `\n${fails} CHECK(S) FAILED`, fails===0?"ok":"err");
+} catch (e) {
+  log("FATAL: " + e.message, "err");
+  console.error(e);
+}
+</script>
+</body>
+</html>

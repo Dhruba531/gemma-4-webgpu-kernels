@@ -1,0 +1,206 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="color-scheme" content="dark" />
+<title>Gemma 4 E2B · WebGPU (from scratch)</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>⚡️</text></svg>">
+<meta name="description" content="Gemma 4 E2B running fully in your browser on WebGPU. Every kernel hand-written from scratch." />
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Geist:wght@300;400;500;600&family=Geist+Mono:wght@400;500&family=Instrument+Serif:ital@0;1&display=swap" rel="stylesheet">
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.169.0/build/three.module.js",
+    "three/examples/jsm/": "https://cdn.jsdelivr.net/npm/three@0.169.0/examples/jsm/"
+  }
+}
+</script>
+<style>
+  :root {
+    --bg: #020203;
+    --t1: rgba(255,255,255,0.92);
+    --t2: rgba(255,255,255,0.55);
+    --t3: rgba(255,255,255,0.32);
+    --line: rgba(255,255,255,0.08);
+    --panel: rgba(255,255,255,0.03);
+    --panel-hover: rgba(255,255,255,0.06);
+    --ok: #64ffa0;
+    --warn: #ffcd6b;
+    --danger: #ff7a6b;
+    --accent: #7e7bff;
+    --accent2: #64ffc8;
+    --display: "Instrument Serif", Georgia, serif;
+    --body: "Geist", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    --mono: "Geist Mono", ui-monospace, Menlo, monospace;
+    --maxw: 860px;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body {
+    background: var(--bg); color: var(--t1); font-family: var(--body);
+    font-size: 16px; line-height: 1.6; -webkit-font-smoothing: antialiased; overflow: hidden;
+  }
+  button, textarea, input, select { font: inherit; color: inherit; }
+  button { appearance: none; background: none; border: 0; cursor: pointer; }
+  ::selection { background: rgba(126,123,255,0.35); }
+
+  /* ===== LANDING ===== */
+  #landing { position: fixed; inset: 0; display: flex; flex-direction: column;
+             transition: opacity .8s ease, transform .8s ease; z-index: 10; }
+  #landing.hidden { opacity: 0; transform: scale(1.04); pointer-events: none; }
+  #crt-frame { position: absolute; inset: 0; opacity: 0; transition: opacity 2s ease .3s; }
+  #crt-frame.visible { opacity: 1; }
+  #crt-canvas { width: 100%; height: 100%; display: block; }
+  .hero-fade { position: absolute; inset: 0; pointer-events: none;
+    background: radial-gradient(120% 80% at 50% 120%, var(--bg) 8%, rgba(2,2,3,.4) 45%, transparent 75%);
+    opacity: 0; transition: opacity 1.6s ease .6s; }
+  .hero-fade.in { opacity: 1; }
+  .hero { position: relative; z-index: 2; margin: auto; text-align: center; padding: 24px;
+          max-width: 720px; }
+  .brand { font-family: var(--mono); font-size: 12px; letter-spacing: .28em; color: var(--t3);
+           text-transform: uppercase; margin-bottom: 22px; }
+  .hero h1 { font-family: var(--display); font-weight: 400; font-size: clamp(48px, 9vw, 104px);
+             line-height: .98; letter-spacing: -.02em; }
+  .hero h1 em { font-style: italic; background: linear-gradient(110deg, var(--accent), var(--accent2));
+                -webkit-background-clip: text; background-clip: text; color: transparent; }
+  .hero p { color: var(--t2); font-size: clamp(15px, 2.4vw, 19px); margin: 22px auto 0; max-width: 520px; }
+  .hero .tag { font-family: var(--mono); color: var(--t3); font-size: 12px; margin-top: 14px; }
+  .enter { margin-top: 38px; display: inline-flex; align-items: center; gap: 10px;
+    padding: 13px 26px; border-radius: 999px; background: var(--t1); color: #050505;
+    font-weight: 500; font-size: 15px; transition: transform .15s ease, box-shadow .2s ease;
+    box-shadow: 0 0 0 0 rgba(126,123,255,.5); }
+  .enter:hover { transform: translateY(-2px); box-shadow: 0 12px 40px -8px rgba(126,123,255,.6); }
+
+  /* ===== CHAT ===== */
+  #chat { position: fixed; inset: 0; display: grid; grid-template-rows: auto 1fr auto;
+          opacity: 0; pointer-events: none; transition: opacity .7s ease; z-index: 5; }
+  #chat.visible { opacity: 1; pointer-events: auto; }
+  header.bar { display: flex; align-items: center; gap: 16px; padding: 14px 22px;
+               border-bottom: 1px solid var(--line); backdrop-filter: blur(8px); }
+  header.bar .logo { font-family: var(--display); font-size: 22px; }
+  header.bar .logo span { background: linear-gradient(110deg, var(--accent), var(--accent2));
+    -webkit-background-clip: text; background-clip: text; color: transparent; }
+  .status { margin-left: auto; font-family: var(--mono); font-size: 12px; color: var(--t2);
+            padding: 6px 12px; border: 1px solid var(--line); border-radius: 999px; }
+  .status.ok { color: var(--ok); border-color: rgba(100,255,160,.25); }
+  .status.busy { color: var(--warn); border-color: rgba(255,205,107,.25); }
+  .status.err { color: var(--danger); border-color: rgba(255,122,107,.3); }
+
+  .main { display: grid; grid-template-columns: 1fr 260px; overflow: hidden; }
+  #messages { overflow-y: auto; padding: 32px 22px 60px; }
+  #messages .inner, .composer-inner { max-width: var(--maxw); margin: 0 auto; }
+  .msg { max-width: var(--maxw); margin: 0 auto 26px; }
+  .msg .role { font-family: var(--mono); font-size: 11px; letter-spacing: .12em; text-transform: uppercase;
+               color: var(--t3); margin-bottom: 8px; }
+  .msg.user .body { background: rgba(255,255,255,.065); border: 1px solid var(--line);
+    padding: 12px 16px; border-radius: 14px; display: inline-block; }
+  .msg .body { color: var(--t1); }
+  .msg .body pre { background: #0c0c10; border: 1px solid var(--line); border-radius: 10px;
+    padding: 14px 16px; overflow-x: auto; margin: 10px 0; font-family: var(--mono); font-size: 13.5px; }
+  .msg .body code { font-family: var(--mono); font-size: .9em; background: rgba(255,255,255,.07);
+    padding: 1px 5px; border-radius: 5px; }
+  .msg .body pre code { background: none; padding: 0; }
+  .cursor { color: var(--accent2); animation: blink 1s steps(2) infinite; }
+  @keyframes blink { 50% { opacity: 0; } }
+
+  aside { border-left: 1px solid var(--line); padding: 22px 18px; overflow-y: auto;
+          background: var(--panel); }
+  aside h3 { font-family: var(--mono); font-size: 11px; letter-spacing: .14em; text-transform: uppercase;
+             color: var(--t3); margin-bottom: 14px; }
+  .ctrl { margin-bottom: 18px; }
+  .ctrl label { display: flex; justify-content: space-between; font-size: 13px; color: var(--t2);
+                margin-bottom: 6px; }
+  .ctrl label b { color: var(--accent2); font-family: var(--mono); font-weight: 500; }
+  input[type=range] { width: 100%; accent-color: var(--accent); }
+  select, .num { width: 100%; background: #0c0c10; border: 1px solid var(--line); color: var(--t1);
+                 padding: 8px 10px; border-radius: 8px; font-size: 13px; }
+  .load-btn { width: 100%; padding: 12px; border-radius: 10px; background: var(--accent);
+    color: #fff; font-weight: 500; margin-top: 6px; transition: filter .15s ease; }
+  .load-btn:hover { filter: brightness(1.1); }
+  .load-btn:disabled { opacity: .5; cursor: default; }
+  #progress { display: none; margin-top: 14px; height: 6px; background: #0c0c10; border-radius: 999px;
+              overflow: hidden; border: 1px solid var(--line); }
+  #progress-bar { height: 100%; width: 0; background: linear-gradient(90deg, var(--accent), var(--accent2));
+                  transition: width .2s ease; }
+  .hint { font-size: 11.5px; color: var(--t3); margin-top: 10px; line-height: 1.5; }
+
+  .composer { border-top: 1px solid var(--line); padding: 16px 22px 22px; }
+  .composer.disabled { opacity: .5; pointer-events: none; }
+  .composer-inner { display: flex; gap: 10px; align-items: flex-end; }
+  #input { flex: 1; resize: none; background: var(--panel); border: 1px solid var(--line);
+    border-radius: 14px; padding: 13px 16px; max-height: 200px; min-height: 50px; line-height: 1.5; }
+  #input:focus { outline: none; border-color: rgba(126,123,255,.5); }
+  #send-btn { padding: 0 22px; height: 50px; border-radius: 14px; background: var(--t1); color: #060606;
+    font-weight: 500; }
+  #send-btn:hover { filter: brightness(.92); }
+
+  @media (max-width: 760px) {
+    .main { grid-template-columns: 1fr; }
+    aside { display: none; }
+  }
+</style>
+</head>
+<body>
+
+  <!-- ===== Landing ===== -->
+  <section id="landing">
+    <div id="crt-frame"><canvas id="crt-canvas"></canvas></div>
+    <div class="hero-fade"></div>
+    <div class="hero">
+      <div class="brand">webgpu · from scratch</div>
+      <h1>Gemma 4 <em>E2B</em></h1>
+      <p>A 2-billion-parameter language model running entirely in your browser — every WebGPU kernel hand-written, no inference library.</p>
+      <div class="tag">tiled matmul · flash-style attention · RoPE · GeGLU · per-layer embeddings · QAT dequant</div>
+      <button class="enter" id="enter-btn">Enter ⚡</button>
+    </div>
+  </section>
+
+  <!-- ===== Chat ===== -->
+  <section id="chat">
+    <header class="bar">
+      <div class="logo">Gemma 4 <span>E2B</span></div>
+      <div id="status" class="status">Model not loaded</div>
+    </header>
+
+    <div class="main">
+      <div id="messages"><div class="inner"></div></div>
+
+      <aside>
+        <h3>Runtime</h3>
+        <div class="ctrl">
+          <label for="backend-select">Backend</label>
+          <select id="backend-select">
+            <option value="webgpu" selected>WebGPU (GPU)</option>
+            <option value="cpu">CPU reference (slow)</option>
+          </select>
+        </div>
+        <button class="load-btn" id="load-btn">Load model</button>
+        <div id="progress"><div id="progress-bar"></div></div>
+        <p class="hint">Weights stream from the HF Hub on first load (large download). Requires a WebGPU-capable browser.</p>
+
+        <h3 style="margin-top:26px">Sampling</h3>
+        <div class="ctrl"><label for="temp">Temperature <b data-for="temp"></b></label>
+          <input type="range" id="temp" min="0" max="2" step="0.05" value="1.0"></div>
+        <div class="ctrl"><label for="topk">Top-K <b data-for="topk"></b></label>
+          <input type="range" id="topk" min="0" max="128" step="1" value="64"></div>
+        <div class="ctrl"><label for="topp">Top-P <b data-for="topp"></b></label>
+          <input type="range" id="topp" min="0.1" max="1" step="0.01" value="0.95"></div>
+        <div class="ctrl"><label for="maxtok">Max new tokens</label>
+          <input class="num" type="number" id="maxtok" value="512" min="1" max="4096"></div>
+      </aside>
+    </div>
+
+    <div class="composer disabled" id="composer">
+      <div class="composer-inner">
+        <textarea id="input" placeholder="Load the model, then say hello…" disabled rows="1"></textarea>
+        <button id="send-btn">Send</button>
+      </div>
+    </div>
+  </section>
+
+  <script type="module" src="./src/main.js"></script>
+</body>
+</html>
