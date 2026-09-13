@@ -253,3 +253,131 @@ fn real_format_parity() {
     assert!(d < 5e-3, "GPU≡CPU on real format (max diff {d:e})");
     eprintln!("  ✓ loads real names/dtypes, runs both backends, GPU≡CPU (max diff {d:e})");
 }
+
+/// The grouped split-K attention kernel (one workgroup per query × kv head ×
+/// key split, serving the whole GQA group) only runs at real head shapes; the
+/// generic tests above fall back to the per-head kernel. Cover it explicitly:
+/// prefill (T > 1, causal), decode with many splits, sliding-window trimming
+/// of the active key range, and both head_dims.
+#[test]
+fn grouped_attention_parity() {
+    let Some(g) = gpu() else { return };
+    let c = CpuBackend::new();
+    let mut r = Lcg::new(21);
+    // (t, s, hq, hkv, dh, window)
+    let cases = [
+        (3usize, 300usize, 8usize, 1usize, 256usize, 0u32),
+        (3, 300, 8, 1, 256, 150),
+        (1, 700, 8, 1, 512, 0),
+        (1, 900, 8, 1, 256, 512),
+        (5, 5, 8, 1, 256, 0),
+        (6, 70, 8, 1, 256, 3),
+        (2, 200, 4, 1, 256, 0),
+        (1, 64, 8, 2, 512, 0),
+    ];
+    for (t, s, hq, hkv, dh, window) in cases {
+        let q = r.rand(t * hq * dh, 0.5);
+        let k = r.rand(s * hkv * dh, 0.5);
+        let v = r.rand(s * hkv * dh, 0.5);
+        let kpos: Vec<u32> = (0..s as u32).collect();
+        let qpos: Vec<u32> = ((s - t) as u32..s as u32).collect();
+        let o = AttnOpts { q_pos: &qpos, k_pos: &kpos, scale: 1.0 / (dh as f32).sqrt(), sliding_window: window, attn_softcap: 0.0 };
+        close(
+            &format!("grouped attention (T={t}, S={s}, Hq={hq}, Hkv={hkv}, Dh={dh}, window={window})"),
+            &g,
+            &g.attention(&g.tensor(&q, &[t, hq, dh]), &g.tensor(&k, &[s, hkv, dh]), &g.tensor(&v, &[s, hkv, dh]), &o),
+            c.attention(&c.tensor(&q, &[t, hq, dh]), &c.tensor(&k, &[s, hkv, dh]), &c.tensor(&v, &[s, hkv, dh]), &o).data(),
+            2e-3,
+        );
+    }
+}
+
+/// Fused ops (single dispatch on the GPU) against their composed reference,
+/// including the 8-row prefill tile (M = 9 covers a partial tile) and every
+/// MATMUL_Q epilogue mode.
+#[test]
+fn fused_op_parity() {
+    let Some(g) = gpu() else { return };
+    let c = CpuBackend::new();
+    let mut r = Lcg::new(33);
+    let scales = |r: &mut Lcg, n: usize| -> Vec<f32> { (0..n).map(|_| 0.01 + r.next() * 0.05).collect() };
+    let randu = |r: &mut Lcg, n: usize, bits: u32| -> Vec<u32> { (0..n).map(|_| (r.next() * (1u32 << bits) as f32).floor() as u32 % (1 << bits)).collect() };
+    let qw = |r: &mut Lcg, n: usize, k: usize, bits: u32| -> QuantWeight {
+        let vals = randu(r, n * k, bits);
+        QuantWeight { qbytes: pack_unsigned(&vals, bits), scales: scales(r, n), shape: [n, k], bits, signed_i8: false, group_size: k }
+    };
+
+    // add_rms_norm: residual + norm(x)·w, with and without the layer scalar
+    {
+        let (t, d) = (5, 48);
+        let x = r.rand(t * d, 1.0);
+        let res = r.rand(t * d, 1.0);
+        let w = r.rand(d, 0.1);
+        let s = [1.37f32];
+        let (gx, gr, gw, gs) = (g.tensor(&x, &[t, d]), g.tensor(&res, &[t, d]), g.tensor(&w, &[d]), g.tensor(&s, &[1]));
+        let (cx, cr, cw, cs) = (c.tensor(&x, &[t, d]), c.tensor(&res, &[t, d]), c.tensor(&w, &[d]), c.tensor(&s, &[1]));
+        close("add_rms_norm", &g, &g.add_rms_norm(&gr, &gx, &gw, 1e-6, None), c.add_rms_norm(&cr, &cx, &cw, 1e-6, None).data(), 2e-3);
+        close("add_rms_norm (·layer_scalar)", &g, &g.add_rms_norm(&gr, &gx, &gw, 1e-6, Some(&gs)), c.add_rms_norm(&cr, &cx, &cw, 1e-6, Some(&cs)).data(), 2e-3);
+    }
+    // head_norm_rope: per-head norm + partial rope in one dispatch (Dh 256 / 512 paths and a tiny head)
+    for (t, heads, dh, rot) in [(3usize, 4usize, 16usize, 8usize), (2, 8, 256, 256), (2, 1, 512, 128)] {
+        let x = r.rand(t * heads * dh, 1.0);
+        let w = r.rand(dh, 0.1);
+        let pos: Vec<u32> = (0..t as u32).map(|i| i * 7 + 3).collect();
+        close(
+            &format!("head_norm_rope (heads={heads}, Dh={dh}, rot={rot})"),
+            &g,
+            &g.head_norm_rope(&g.tensor(&x, &[t, heads, dh]), &g.tensor(&w, &[dh]), 1e-6, &pos, 1e4, dh, heads, rot),
+            c.head_norm_rope(&c.tensor(&x, &[t, heads, dh]), &c.tensor(&w, &[dh]), 1e-6, &pos, 1e4, dh, heads, rot).data(),
+            2e-3,
+        );
+    }
+    // linear at M = 8 and 9 (MROWS = 8 row tiles) and M = 70 / 64 (shared-memory
+    // tiled GEMM, partial and full 64-row tiles, N not a multiple of 64) for every bit width
+    for bits in [2u32, 4, 8] {
+        let (n, k) = (70, 96);
+        let q = if bits == 8 {
+            let qbytes: Vec<u8> = (0..n * k).map(|_| (r.next() * 256.0).floor() as u32 as u8).collect();
+            QuantWeight { qbytes, scales: scales(&mut r, n), shape: [n, k], bits: 8, signed_i8: true, group_size: k }
+        } else {
+            qw(&mut r, n, k, bits)
+        };
+        for m in [8usize, 9, 64, 70] {
+            let x = r.rand(m * k, 1.0);
+            close(&format!("linear q{bits} M={m}"), &g, &g.linear(&g.tensor(&x, &[m, k]), &g.quant_tensor(q.clone())), c.linear(&c.tensor(&x, &[m, k]), &c.quant_tensor(q.clone())).data(), 4e-3);
+        }
+    }
+    // linear_geglu: gelu(x·Wgᵀ)·(x·Wuᵀ) at decode (M=1), M=4 and prefill (M=9)
+    for bits in [2u32, 4] {
+        let (n, k) = (40, 64);
+        let wg = qw(&mut r, n, k, bits);
+        let wu = qw(&mut r, n, k, bits);
+        for m in [1usize, 4, 9, 40] {
+            let x = r.rand(m * k, 1.0);
+            close(
+                &format!("linear_geglu q{bits} M={m}"),
+                &g,
+                &g.linear_geglu(&g.tensor(&x, &[m, k]), &g.quant_tensor(wg.clone()), &g.quant_tensor(wu.clone())),
+                c.linear_geglu(&c.tensor(&x, &[m, k]), &c.quant_tensor(wg.clone()), &c.quant_tensor(wu.clone())).data(),
+                2e-3,
+            );
+        }
+    }
+    // linear_gelu_mul_cols: gelu(x·Wᵀ) · b[:, off:off+N] (the PLE gate)
+    {
+        let (n, k, stride, off) = (24, 32, 96, 48);
+        let qbytes: Vec<u8> = (0..n * k).map(|_| (r.next() * 256.0).floor() as u32 as u8).collect();
+        let w = QuantWeight { qbytes, scales: scales(&mut r, n), shape: [n, k], bits: 8, signed_i8: true, group_size: k };
+        for m in [1usize, 6, 33] {
+            let x = r.rand(m * k, 1.0);
+            let b = r.rand(m * stride, 1.0);
+            close(
+                &format!("linear_gelu_mul_cols i8 M={m}"),
+                &g,
+                &g.linear_gelu_mul_cols(&g.tensor(&x, &[m, k]), &g.quant_tensor(w.clone()), &g.tensor(&b, &[m, stride]), off),
+                c.linear_gelu_mul_cols(&c.tensor(&x, &[m, k]), &c.quant_tensor(w.clone()), &c.tensor(&b, &[m, stride]), off).data(),
+                2e-3,
+            );
+        }
+    }
+}

@@ -79,9 +79,14 @@ quantized model, loaded through the streaming path, matches the CPU reference to
 ## Rust port
 
 `rust/` contains a native port of this engine on [`wgpu`](https://wgpu.rs):
-the same WGSL kernels byte-for-byte, the same backend-agnostic graph, and the
-same CPU-vs-GPU parity test-suite, plus a CLI (`download` / `chat` /
-`generate` / `bench`). See [rust/README.md](rust/README.md).
+the same backend-agnostic graph and the same CPU-vs-GPU parity test-suite,
+plus a CLI (`download` / `chat` / `generate` / `bench`). Its kernels started
+as byte-for-byte copies of `src/engine/kernels.js` and have since been
+reworked for throughput (fused ops, grouped split-K attention, a tiled prefill
+GEMM, a cached-bind-group host path): 3.2 ms/token prefill and 16 ms/token
+decode (62 tok/s) on an M4, vs ~17 / ~26 in the browser. See
+[rust/README.md](rust/README.md); those kernel changes have not been ported
+back to the JS engine.
 
 ## What's implemented
 

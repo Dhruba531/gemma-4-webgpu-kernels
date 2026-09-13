@@ -127,6 +127,45 @@ pub trait Backend {
     /// Append `add` rows to the KV tensor `existing` (in place where possible).
     fn kv_append(&self, existing: Option<&Self::Tensor>, add: &Self::Tensor) -> KvAppend<Self::Tensor>;
 
+    // --- fused ops ----------------------------------------------------------
+    // Defaults compose the primitives above (the reference semantics); GPU
+    // backends override them with single dispatches.
+
+    /// `(residual + rms_norm(x, w)) · scale_by[0]` — every Gemma-4 post-norm is
+    /// followed by a residual add, and the per-layer-input norm additionally by
+    /// the learned `layer_scalar`.
+    fn add_rms_norm(&self, residual: &Self::Tensor, x: &Self::Tensor, w: &Self::Tensor, eps: f32, scale_by: Option<&Self::Tensor>) -> Self::Tensor {
+        let n = self.rms_norm(x, Some(w), eps);
+        let h = self.add(residual, &n);
+        match scale_by {
+            Some(s) => self.scale_by_tensor(&h, s),
+            None => h,
+        }
+    }
+    /// Per-head weighted RMSNorm followed by half-split partial RoPE on
+    /// `[T, heads, head_dim]` — the q/k path of every attention block.
+    #[allow(clippy::too_many_arguments)]
+    fn head_norm_rope(&self, x: &Self::Tensor, w: &Self::Tensor, eps: f32, positions: &[u32], theta: f32, head_dim: usize, heads: usize, rotary_dim: usize) -> Self::Tensor {
+        let t = x.shape()[0];
+        let flat = self.reshape(x, &[t * heads, head_dim]);
+        let normed = self.rms_norm(&flat, Some(w), eps);
+        let normed = self.reshape(&normed, &[t, heads, head_dim]);
+        self.rope(&normed, positions, theta, head_dim, heads, rotary_dim)
+    }
+    /// `gelu(x · Wgᵀ) * (x · Wuᵀ)` — the GeGLU MLP input, gate and up in one pass.
+    fn linear_geglu(&self, x: &Self::Tensor, w_gate: &Self::Tensor, w_up: &Self::Tensor) -> Self::Tensor {
+        let g = self.linear(x, w_gate);
+        let u = self.linear(x, w_up);
+        self.geglu(&g, &u)
+    }
+    /// `gelu(x · Wᵀ) * b[:, offset : offset + N]` with `b` a `[M, stride]` tensor —
+    /// the per-layer-input gate multiplied by this layer's PLE slice.
+    fn linear_gelu_mul_cols(&self, x: &Self::Tensor, w: &Self::Tensor, b: &Self::Tensor, offset: usize) -> Self::Tensor {
+        let g = self.linear(x, w);
+        let s = self.slice_cols(b, offset, w.shape()[0]);
+        self.geglu(&g, &s)
+    }
+
     // --- sync / lifecycle ------------------------------------------------
     /// Blocking read of a tensor's f32 contents (submits pending work first).
     fn readback(&self, t: &Self::Tensor) -> Vec<f32>;

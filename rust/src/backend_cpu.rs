@@ -39,6 +39,19 @@ fn t(data: Vec<f32>, shape: &[usize]) -> CpuTensor {
     CpuTensor::new(data, shape)
 }
 
+/// A raw pointer that may cross into scoped threads; the callers partition the
+/// pointee into disjoint row ranges, one per thread.
+#[derive(Clone, Copy)]
+struct SyncPtr(*mut f32);
+unsafe impl Send for SyncPtr {}
+unsafe impl Sync for SyncPtr {}
+impl SyncPtr {
+    // accessed through a method so closures capture the wrapper, not the raw field
+    fn get(&self) -> *mut f32 {
+        self.0
+    }
+}
+
 pub fn gelu_tanh_scalar(v: f32) -> f32 {
     let c = (2.0f32 / std::f32::consts::PI).sqrt();
     0.5 * v * (1.0 + (c * (v + 0.044715 * v * v * v)).tanh())
@@ -46,6 +59,36 @@ pub fn gelu_tanh_scalar(v: f32) -> f32 {
 
 #[derive(Default)]
 pub struct CpuBackend;
+
+/// Below this many multiply-adds an op runs on the calling thread.
+const PAR_MIN_WORK: usize = 1 << 14;
+
+/// Run `f(start, end)` over `[0, n)` split into contiguous chunks across the
+/// available cores (scoped threads, no pool). Each chunk owns disjoint output
+/// rows, so the per-row arithmetic — and therefore every result — is identical
+/// to the sequential loop.
+fn par_ranges(n: usize, work: usize, f: impl Fn(usize, usize) + Sync) {
+    // GEMMA_CPU_THREADS overrides the core count (1 = sequential reference).
+    let threads = std::env::var("GEMMA_CPU_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&t| t >= 1)
+        .unwrap_or_else(|| std::thread::available_parallelism().map(|x| x.get()).unwrap_or(1))
+        .min(n)
+        .max(1);
+    if threads == 1 || work < PAR_MIN_WORK {
+        f(0, n);
+        return;
+    }
+    let chunk = n.div_ceil(threads);
+    std::thread::scope(|s| {
+        for start in (0..n).step_by(chunk) {
+            let end = (start + chunk).min(n);
+            let f = &f;
+            s.spawn(move || f(start, end));
+        }
+    });
+}
 
 impl CpuBackend {
     pub fn new() -> Self {
@@ -107,17 +150,22 @@ impl Backend for CpuBackend {
         let d = *x.shape.last().unwrap();
         let rows = x.size() / d;
         let mut out = vec![0.0f32; rows * d];
-        for i in 0..rows {
-            let base = i * d;
-            let mut ss = 0.0f32;
-            for dd in 0..d {
-                let v = x.data[base + dd];
-                ss += v * v;
-            }
+        let wd = w.map(|w| w.data.as_slice());
+        for (i, o) in out.chunks_mut(d).enumerate() {
+            let xr = &x.data[i * d..(i + 1) * d];
+            let ss: f32 = xr.iter().map(|v| v * v).sum();
             let inv = 1.0 / (ss / d as f32 + eps).sqrt();
-            for dd in 0..d {
-                let wv = w.map_or(1.0, |w| w.data[dd]);
-                out[base + dd] = x.data[base + dd] * inv * wv;
+            match wd {
+                Some(wd) => {
+                    for dd in 0..d {
+                        o[dd] = xr[dd] * inv * wd[dd];
+                    }
+                }
+                None => {
+                    for dd in 0..d {
+                        o[dd] = xr[dd] * inv;
+                    }
+                }
             }
         }
         t(out, &x.shape)
@@ -126,36 +174,48 @@ impl Backend for CpuBackend {
     fn linear(&self, x: &CpuTensor, w: &CpuTensor) -> CpuTensor {
         let (tt, k) = (x.shape[0], x.shape[1]);
         let n = w.shape[0];
-        let mut out = vec![0.0f32; tt * n];
-        if let Some(q) = &w.quant {
-            // Dequantize each weight row once, then dot it against every input
-            // row: same per-element products and summation order as the naive
-            // loop, just without re-unpacking the row T times.
-            let mut row = vec![0.0f32; k];
-            for nn in 0..n {
-                for kk in 0..k {
-                    row[kk] = q.deq(nn, kk);
-                }
-                for i in 0..tt {
-                    let xb = &x.data[i * k..(i + 1) * k];
-                    let mut acc = 0.0f32;
-                    for kk in 0..k {
-                        acc += xb[kk] * row[kk];
+        // Output rows (weight rows) are split across cores; each thread fills
+        // its own [n-chunk, T] block of the transposed result, which is then
+        // laid out as [T, N]. Per-element products and summation order match
+        // the naive loop exactly.
+        let mut out_t = vec![0.0f32; n * tt];
+        let quant = w.quant.as_deref();
+        {
+            let out_ptr = SyncPtr(out_t.as_mut_ptr());
+            par_ranges(n, n * k * tt, |start, end| {
+                // SAFETY: each range writes only rows [start, end) of out_t,
+                // and ranges handed to different threads are disjoint.
+                let dst = unsafe { std::slice::from_raw_parts_mut(out_ptr.get().add(start * tt), (end - start) * tt) };
+                let mut row = vec![0.0f32; k];
+                for nn in start..end {
+                    let wb: &[f32] = match quant {
+                        Some(q) => {
+                            // dequantize the weight row once, reuse for every input row
+                            for kk in 0..k {
+                                row[kk] = q.deq(nn, kk);
+                            }
+                            &row
+                        }
+                        None => &w.data[nn * k..(nn + 1) * k],
+                    };
+                    for i in 0..tt {
+                        let xb = &x.data[i * k..(i + 1) * k];
+                        let mut acc = 0.0f32;
+                        for kk in 0..k {
+                            acc += xb[kk] * wb[kk];
+                        }
+                        dst[(nn - start) * tt + i] = acc;
                     }
-                    out[i * n + nn] = acc;
                 }
-            }
-            return t(out, &[tt, n]);
+            });
         }
-        for i in 0..tt {
-            let xb = &x.data[i * k..(i + 1) * k];
-            for nn in 0..n {
-                let wb = &w.data[nn * k..(nn + 1) * k];
-                let mut acc = 0.0f32;
-                for kk in 0..k {
-                    acc += xb[kk] * wb[kk];
-                }
-                out[i * n + nn] = acc;
+        if tt == 1 {
+            return t(out_t, &[1, n]);
+        }
+        let mut out = vec![0.0f32; tt * n];
+        for nn in 0..n {
+            for i in 0..tt {
+                out[i * n + nn] = out_t[nn * tt + i];
             }
         }
         t(out, &[tt, n])
@@ -208,6 +268,7 @@ impl Backend for CpuBackend {
     }
 
     // Multi/grouped-query causal attention with optional sliding window.
+    // (query, head) rows are independent and split across cores.
     fn attention(&self, q: &CpuTensor, k: &CpuTensor, v: &CpuTensor, o: &AttnOpts) -> CpuTensor {
         let (tt, hq, dh) = (q.shape[0], q.shape[1], q.shape[2]);
         let s = k.shape[0];
@@ -215,10 +276,14 @@ impl Backend for CpuBackend {
         let dv = v.shape[2];
         let group = hq / hkv;
         let mut out = vec![0.0f32; tt * hq * dv];
-        let mut scores = vec![0.0f32; s];
-        for i in 0..tt {
-            let qpos = o.q_pos[i];
-            for h in 0..hq {
+        let out_ptr = SyncPtr(out.as_mut_ptr());
+        par_ranges(tt * hq, tt * hq * s * (dh + dv), |start, end| {
+            // SAFETY: row r of `out` is written only by the range containing r.
+            let dst = unsafe { std::slice::from_raw_parts_mut(out_ptr.get().add(start * dv), (end - start) * dv) };
+            let mut scores = vec![0.0f32; s];
+            for r in start..end {
+                let (i, h) = (r / hq, r % hq);
+                let qpos = o.q_pos[i];
                 let kvh = h / group;
                 let qb = (i * hq + h) * dh;
                 let mut maxv = f32::NEG_INFINITY;
@@ -254,7 +319,7 @@ impl Backend for CpuBackend {
                     }
                 }
                 let inv = if sum > 0.0 { 1.0 / sum } else { 0.0 };
-                let ob = (i * hq + h) * dv;
+                let ob = (r - start) * dv;
                 for j in 0..s {
                     let w = scores[j] * inv;
                     if w == 0.0 {
@@ -262,11 +327,11 @@ impl Backend for CpuBackend {
                     }
                     let vb = (j * hkv + kvh) * dv;
                     for d in 0..dv {
-                        out[ob + d] += w * v.data[vb + d];
+                        dst[ob + d] += w * v.data[vb + d];
                     }
                 }
             }
-        }
+        });
         t(out, &[tt, hq * dv])
     }
 

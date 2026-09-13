@@ -38,9 +38,10 @@ struct ModelArgs {
     dir: PathBuf,
     #[arg(long, value_enum, default_value_t = BackendKind::Wgpu)]
     backend: BackendKind,
-    /// Compile kernels without runtime bounds checks (faster; kernels are parity-tested)
+    /// Compile kernels WITH naga's runtime bounds checks (2-6x slower; the
+    /// default trusts the parity-tested kernels)
     #[arg(long)]
-    trusted_shaders: bool,
+    checked_shaders: bool,
 }
 
 #[derive(clap::Args, Clone)]
@@ -112,12 +113,16 @@ enum Cmd {
         /// Divide the vocab (262144) by this to shrink the lm_head/embedding tables
         #[arg(long, default_value_t = 1)]
         vdiv: usize,
-        /// Also time isolated kernel shapes
+        /// Also time isolated kernel shapes (wgpu only)
         #[arg(long)]
         kernels: bool,
-        /// Compile kernels without runtime bounds checks (faster; kernels are parity-tested)
+        /// Compile kernels WITH naga's runtime bounds checks (2-6x slower)
         #[arg(long)]
-        trusted_shaders: bool,
+        checked_shaders: bool,
+        /// Backend to time; `cpu` runs the threaded reference backend (set
+        /// GEMMA_CPU_THREADS=1 for the sequential baseline)
+        #[arg(long, value_enum, default_value_t = BackendKind::Wgpu)]
+        backend: BackendKind,
     },
     /// Print the wgpu adapter this machine would use
     Info,
@@ -129,7 +134,7 @@ fn main() {
         Cmd::Download { repo, revision, dir } => download(&repo, &revision, &dir),
         Cmd::Chat { model, sampling } => with_backend(model, |b, m| chat(b, m, &sampling)),
         Cmd::Generate { model, sampling, prompt } => with_backend(model, |b, m| generate(b, m, &sampling, &prompt)),
-        Cmd::Bench { prefill, decode, vdiv, kernels, trusted_shaders } => bench(prefill, decode, vdiv, kernels, trusted_shaders),
+        Cmd::Bench { prefill, decode, vdiv, kernels, checked_shaders, backend } => bench(prefill, decode, vdiv, kernels, !checked_shaders, backend),
         Cmd::Info => info(),
     };
     if let Err(e) = res {
@@ -188,13 +193,13 @@ fn with_backend(args: ModelArgs, f: impl FnOnce(BackendKind, &mut dyn ChatEngine
     };
     match args.backend {
         BackendKind::Wgpu => {
-            let b = Arc::new(WgpuBackend::create()?.with_trusted_shaders(args.trusted_shaders));
-            eprintln!("gpu: {} ({}){}", b.ctx.info.name, b.ctx.info.backend, if b.trusted_shaders() { ", trusted shaders" } else { "" });
+            let b = Arc::new(WgpuBackend::create()?.with_trusted_shaders(!args.checked_shaders));
+            eprintln!("gpu: {} ({}){}", b.ctx.info.name, b.ctx.info.backend, if b.trusted_shaders() { ", trusted shaders" } else { ", checked shaders" });
             let mut e = Gemma4Mobile::load(&args.dir, b, &mut progress)?;
             f(BackendKind::Wgpu, &mut e)
         }
         BackendKind::Cpu => {
-            eprintln!("warning: the CPU backend is a correctness reference; expect seconds per token");
+            eprintln!("warning: the CPU backend is the correctness reference (threaded, but expect ~10x slower than the GPU)");
             let mut e = Gemma4Mobile::load(&args.dir, Arc::new(CpuBackend::new()), &mut progress)?;
             f(BackendKind::Cpu, &mut e)
         }
@@ -333,16 +338,16 @@ enum Spec {
 }
 
 /// Synthetic weights at the real E2B shapes, generated on demand and uploaded once.
-struct BenchWeights {
+struct BenchWeights<B: Backend> {
     table: std::collections::HashMap<String, Spec>,
-    backend: Arc<WgpuBackend>,
+    backend: Arc<B>,
     rng: std::cell::RefCell<Xorshift>,
-    cache: std::cell::RefCell<std::collections::HashMap<String, <WgpuBackend as Backend>::Tensor>>,
+    cache: std::cell::RefCell<std::collections::HashMap<String, B::Tensor>>,
     uploaded: std::cell::Cell<usize>,
 }
 
-impl WeightSource<WgpuBackend> for BenchWeights {
-    fn get(&self, name: &str) -> Option<<WgpuBackend as Backend>::Tensor> {
+impl<B: Backend> WeightSource<B> for BenchWeights<B> {
+    fn get(&self, name: &str) -> Option<B::Tensor> {
         if let Some(t) = self.cache.borrow().get(name) {
             return Some(t.clone());
         }
@@ -369,12 +374,26 @@ impl WeightSource<WgpuBackend> for BenchWeights {
     }
 }
 
-fn bench(prefill: usize, decode: usize, vdiv: usize, kernels: bool, trusted: bool) -> Result<(), String> {
-    let g = Arc::new(WgpuBackend::create()?.with_trusted_shaders(trusted));
-    println!("gpu: {} ({}){}", g.ctx.info.name, g.ctx.info.backend, if g.trusted_shaders() { ", trusted shaders" } else { "" });
-    if kernels {
-        kernel_bench(&g);
+fn bench(prefill: usize, decode: usize, vdiv: usize, kernels: bool, trusted: bool, backend: BackendKind) -> Result<(), String> {
+    match backend {
+        BackendKind::Wgpu => {
+            let g = Arc::new(WgpuBackend::create()?.with_trusted_shaders(trusted));
+            println!("gpu: {} ({}){}", g.ctx.info.name, g.ctx.info.backend, if g.trusted_shaders() { ", trusted shaders" } else { ", checked shaders" });
+            if kernels {
+                kernel_bench(&g);
+            }
+            model_bench(g.clone(), prefill, decode, vdiv, || g.wait_idle())
+        }
+        BackendKind::Cpu => {
+            let threads = std::env::var("GEMMA_CPU_THREADS").ok().unwrap_or_else(|| std::thread::available_parallelism().map(|x| x.get()).unwrap_or(1).to_string());
+            println!("cpu reference backend, {threads} threads");
+            model_bench(Arc::new(CpuBackend::new()), prefill, decode, vdiv, || {})
+        }
     }
+}
+
+/// Time prefill + decode of the full graph at real shapes on any backend.
+fn model_bench<B: Backend>(g: Arc<B>, prefill: usize, decode: usize, vdiv: usize, wait_idle: impl Fn()) -> Result<(), String> {
     let mut raw: serde_json::Value = serde_json::from_str(gemma_wgpu::GEMMA4_E2B_CONFIG_JSON).unwrap();
     let v = raw["text_config"]["vocab_size"].as_u64().unwrap() as usize / vdiv.max(1);
     raw["text_config"]["vocab_size"] = v.into();
@@ -425,7 +444,7 @@ fn bench(prefill: usize, decode: usize, vdiv: usize, kernels: bool, trusted: boo
     for n in &names {
         weights.get(n); // exclude upload from timings
     }
-    g.wait_idle();
+    wait_idle();
     println!("weights: {:.2} GiB uploaded in {:.1}s", weights.uploaded.get() as f64 / (1u64 << 30) as f64, t0.elapsed().as_secs_f64());
     let mut model = Gemma4Model::new(c.clone(), g.clone(), weights);
 
@@ -435,8 +454,10 @@ fn bench(prefill: usize, decode: usize, vdiv: usize, kernels: bool, trusted: boo
     let finite = |a: &[f32]| a.iter().all(|x| x.is_finite());
     let l2 = |a: &[f32]| a.iter().take(512).map(|x| x * x).sum::<f32>().sqrt();
 
-    // warm up pipelines with a tiny pass, then time prefill
-    model.forward(&[ids[0]], &[0]);
+    // warm up: compile every pipeline variant (prefill-tile and decode shapes)
+    // before timing, so shader compilation never lands inside a measurement
+    model.forward(&ids, &pos);
+    model.forward(&[ids[0]], &[prefill as u32]);
     model.reset();
     let t = Instant::now();
     let mut logits = model.forward(&ids, &pos);
@@ -490,6 +511,19 @@ fn kernel_bench(g: &Arc<WgpuBackend>) {
         cases.push(("mlp gate 4b [6144,1536]", 60, Box::new(move || g2.linear(&x, &w))));
     }
     {
+        let wg = qt(&mut rng, 6144, 1536, 4, false);
+        let wu = qt(&mut rng, 6144, 1536, 4, false);
+        let x = g.tensor(&rng.f32s(1536, 0.1, 0.0), &[1, 1536]);
+        let g2 = g.clone();
+        cases.push(("mlp gate+up geglu 4b [6144,1536]x2", 60, Box::new(move || g2.linear_geglu(&x, &wg, &wu))));
+    }
+    {
+        let w = qt(&mut rng, 12288, 1536, 2, false);
+        let x = g.tensor(&rng.f32s(64 * 1536, 0.1, 0.0), &[64, 1536]);
+        let g2 = g.clone();
+        cases.push(("mlp gate 2b [12288,1536] M=64 (prefill)", 20, Box::new(move || g2.linear(&x, &w))));
+    }
+    {
         let w = qt(&mut rng, 1536, 6144, 2, false);
         let x = g.tensor(&rng.f32s(6144, 0.1, 0.0), &[1, 6144]);
         let g2 = g.clone();
@@ -515,6 +549,15 @@ fn kernel_bench(g: &Arc<WgpuBackend>) {
         let g2 = g.clone();
         cases.push(("attention Dh256 S512", 60, Box::new(move || g2.attention(&q, &k, &v, &gemma_wgpu::backend::AttnOpts { q_pos: &[511], k_pos: &kp, scale: 1.0 / 16.0, sliding_window: 512, attn_softcap: 0.0 }))));
     }
+    for (dh, s, window) in [(256usize, 2048usize, 512u32), (512, 2048, 0), (256, 8192, 512), (512, 8192, 0)] {
+        let q = g.tensor(&rng.f32s(8 * dh, 0.1, 0.0), &[1, 8, dh]);
+        let k = g.tensor(&rng.f32s(s * dh, 0.1, 0.0), &[s, 1, dh]);
+        let v = g.tensor(&rng.f32s(s * dh, 0.1, 0.0), &[s, 1, dh]);
+        let kp: Vec<u32> = (0..s as u32).collect();
+        let g2 = g.clone();
+        let name: &'static str = Box::leak(format!("attention Dh{dh} S{s} window{window}").into_boxed_str());
+        cases.push((name, 60, Box::new(move || g2.attention(&q, &k, &v, &gemma_wgpu::backend::AttnOpts { q_pos: &[(s - 1) as u32], k_pos: &kp, scale: 1.0 / 16.0, sliding_window: window, attn_softcap: 0.0 }))));
+    }
     {
         // chained: measures dependent dispatch-to-dispatch latency
         let mut x = g.tensor(&rng.f32s(1536, 0.1, 0.0), &[1, 1536]);
@@ -530,8 +573,10 @@ fn kernel_bench(g: &Arc<WgpuBackend>) {
     }
     println!("kernel timings (ms/op):");
     for (name, reps, run) in cases.iter_mut() {
-        let out = run();
-        g.readback(&out); // warmup + pipeline compile
+        for _ in 0..3 {
+            let out = run();
+            g.readback(&out); // warmup + pipeline compile
+        }
         let t0 = Instant::now();
         let mut out = run();
         for _ in 1..*reps {
